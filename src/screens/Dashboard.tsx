@@ -1,4 +1,4 @@
-import { getDecodedToken, getEncodedToken, Token } from "@cashu/cashu-ts";
+import { getDecodedToken, Token } from "@cashu/cashu-ts";
 import Balance from "@comps/Balance";
 import { IconBtn } from "@comps/Button";
 import useLoading from "@comps/hooks/Loading";
@@ -7,43 +7,34 @@ import BottomSheetOptionsModal from "@comps/modal/BottomSheetOptionsModal";
 import Txt from "@comps/Txt";
 import BottomSheet from "@gorhom/bottom-sheet";
 import { _testmintUrl, env } from "@consts";
-import { l } from "@log";
 import type { TBeforeRemoveEvent, TDashboardPageProps } from "@model/nav";
 import BottomNav from "@nav/BottomNav";
 import { preventBack } from "@nav/utils";
-import { useFocusClaimContext } from "@src/context/FocusClaim";
-import { useHistoryContext } from "@src/context/History";
-import { useInitialURL } from "@src/context/Linking";
 import { usePromptContext } from "@src/context/Prompt";
 import { useThemeContext } from "@src/context/Theme";
 import { useTrustMintContext } from "@src/context/TrustMint";
 import { useKnownMints } from "@src/context/KnownMints";
 import { NS } from "@src/i18n";
 // import { useQRScanHandler } from "@util/qrScanner"; // No longer needed - using dedicated screen
-import { mintRepository } from "@src/storage/db/repo/MintRepository";
 import { mintService } from "@src/services/MintService";
 import { highlight as hi, mainColors } from "@styles";
 import { getStrFromClipboard } from "@util";
-import { claimToken, getMintsForPayment } from "@wallet";
-import { sumProofsValue } from "@wallet/proofs";
+import { getMintsForPayment } from "@wallet";
 import { useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { TouchableOpacity, View } from "react-native";
 import { s, ScaledSheet } from "react-native-size-matters";
+import { useManager } from "@src/context/Manager";
 
 export default function Dashboard({ navigation, route }: TDashboardPageProps) {
   const { t } = useTranslation([NS.common]);
-  // The URL content that redirects to this app after clicking on it (cashu:)
-  const { url, clearUrl } = useInitialURL();
-  // Theme
+  const manager = useManager();
   const { color, highlight } = useThemeContext();
   // State to indicate token claim from clipboard after app comes to the foreground, to re-render total balance
-  const { claimed } = useFocusClaimContext();
   // Loading state
   const { loading, startLoading, stopLoading } = useLoading();
   // Prompt modal
   const { openPromptAutoClose } = usePromptContext();
-  const { addHistoryEntry } = useHistoryContext();
   // Trust mint modal
   const { showTrustMintModal } = useTrustMintContext();
   const { knownMints } = useKnownMints();
@@ -52,58 +43,6 @@ export default function Dashboard({ navigation, route }: TDashboardPageProps) {
   // Bottom sheet refs
   const sendOptionsRef = useRef<BottomSheet>(null);
   const receiveOptionsRef = useRef<BottomSheet>(null);
-
-  const receiveToken = async (token: Token) => {
-    if (loading) {
-      return;
-    }
-    startLoading();
-    try {
-      const success = await claimToken(token);
-      if (success) {
-        openPromptAutoClose({
-          msg: t("claimSuccess", {
-            amount: sumProofsValue(token.proofs),
-            mintUrl: token.mint,
-            memo: token.memo,
-          }),
-          success: true,
-        });
-        // add as history entry
-        await addHistoryEntry({
-          amount: sumProofsValue(token.proofs),
-          type: 1,
-          value: getEncodedToken(token),
-          mints: [token.mint],
-        });
-        return;
-      }
-      openPromptAutoClose({ msg: t("claimTokenErr") });
-    } catch (e) {
-      l(e);
-      openPromptAutoClose({ msg: t("claimTokenErr") });
-    } finally {
-      stopLoading();
-    }
-  };
-
-  const handleTrustFlow = async (token: Token) => {
-    try {
-      const action = await showTrustMintModal(token);
-
-      if (action === "trust") {
-        await mintService.addMint(token.mint);
-        await receiveToken(token);
-      } else if (action === "swap") {
-        // The swap navigation is handled in the modal itself
-        // No additional action needed here
-      }
-      // If action is 'cancel', do nothing
-    } catch (e) {
-      l(e);
-      openPromptAutoClose({ msg: t("claimTokenErr") });
-    }
-  };
 
   const handleClaimBtnPress = async () => {
     if (loading) {
@@ -130,11 +69,15 @@ export default function Dashboard({ navigation, route }: TDashboardPageProps) {
     if (!knownMints.find((m) => m.mintUrl === decoded.mint)) {
       stopLoading();
       // Show trust modal
-      await handleTrustFlow(decoded);
-      return;
+      const action = await showTrustMintModal(decoded);
+      if (action === "trust") {
+        await manager.mint.addMint(decoded.mint);
+      } else {
+        return;
+      }
     }
 
-    await receiveToken(decoded);
+    await manager.wallet.receive(decoded);
   };
 
   const handleMintBtnPress = async () => {
