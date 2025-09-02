@@ -27,9 +27,8 @@ import { secureStore, store } from "@store";
 import { SECURESTORE_KEY, STORE_KEYS } from "@store/consts";
 import { dark, light } from "@styles";
 import { isErr, isNull, isStr } from "@util";
-import * as SplashScreen from "expo-splash-screen";
 import { StatusBar } from "expo-status-bar";
-import { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AppState } from "react-native";
 import { MenuProvider } from "react-native-popup-menu";
@@ -43,12 +42,12 @@ import QRScannerBottomSheet from "./QRScannerBottomSheet";
 import TrustMintModal from "./modal/TrustMintModal";
 import Toaster from "./Toaster";
 
-import "../shim";
-import {
-  ManagerProvider,
-  ManagerGate,
-  useManagerContext,
-} from "@src/context/Manager";
+import * as SplashScreen from "expo-splash-screen";
+import { ManagerProvider } from "@src/context/Manager";
+import * as SQLite from "expo-sqlite";
+import { ExpoSqliteRepositories } from "coco-cashu-expo-sqlite";
+import { ConsoleLogger, Manager } from "coco-cashu-core";
+import { getSeed } from "@src/storage/store/restore";
 
 interface ILockData {
   mismatch: boolean;
@@ -58,18 +57,18 @@ interface ILockData {
   lockedTime: number;
   timestamp: number;
 }
+type PinContextValue = React.ContextType<typeof PinCtx>;
 
 l("[APP] Starting app...");
 
 void SplashScreen.preventAutoHideAsync();
+
 function App(_: { exp: Record<string, unknown> }) {
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
       <SafeAreaProvider>
         <CustomErrorBoundary catchErrors="always">
-          <ManagerProvider>
-            <My_App />
-          </ManagerProvider>
+          <RootApp />
         </CustomErrorBoundary>
       </SafeAreaProvider>
     </GestureHandlerRootView>
@@ -77,16 +76,13 @@ function App(_: { exp: Record<string, unknown> }) {
 }
 export default App;
 
-function My_App() {
-  const { waitUntilReady } = useManagerContext();
-  // initial auth state
+function useRootAppState() {
+  const [manager, setManager] = useState<Manager | null>(null);
   const [auth, setAuth] = useState<INavigatorProps>({ pinHash: "" });
   const [shouldOnboard, setShouldOnboard] = useState(false);
   const [hasSeed, setHasSeed] = useState(false);
   const [sawSeedUpdate, setSawSeedUpdate] = useState(false);
-  // app was longer than 5 mins in the background
   const [bgAuth, setBgAuth] = useState(false);
-  // PIN mismatch state
   const [attempts, setAttempts] = useState({
     mismatch: false,
     mismatchCount: 0,
@@ -95,20 +91,34 @@ function My_App() {
     lockedTime: 0,
   });
   const pinData = { attempts, setAttempts };
-  // i18next
-  const { t, i18n } = useTranslation([NS.common]);
-  // app ready to render content
+  const { i18n } = useTranslation([NS.common]);
   const [isRdy, setIsRdy] = useState(false);
-  // app foregorund, background
   const appState = useRef(AppState.currentState);
 
-  // init stored data
+  const handlePinForeground = async () => {
+    const pw = await secureStore.get(SECURESTORE_KEY);
+    if (isNull(pw)) {
+      return;
+    }
+    const now = Math.ceil(Date.now() / 1000);
+    const lockData = await store.getObj<ILockData>(STORE_KEYS.lock);
+    if (lockData) {
+      const secsPassed = now - lockData.timestamp;
+      const lockedTime = lockData.lockedTime - secsPassed;
+      const { timestamp: _timestamp, ...rest } = lockData;
+      setAttempts({ ...rest, mismatch: false, lockedTime });
+    }
+    const bgTimestamp = await store.get(STORE_KEYS.bgCounter);
+    if (isStr(bgTimestamp) && bgTimestamp.length > 0) {
+      if (now - +bgTimestamp > FiveMins) {
+        setBgAuth(true);
+      }
+    }
+  };
+
   const initData = async () => {
     try {
-      const [lang] = await Promise.all([
-        // preferred language
-        store.get(STORE_KEYS.lang),
-      ]);
+      const [lang] = await Promise.all([store.get(STORE_KEYS.lang)]);
       if (lang?.length) {
         await i18n.changeLanguage(lang);
       }
@@ -121,7 +131,6 @@ function My_App() {
     }
   };
 
-  // init auth data
   const initAuth = async () => {
     const [pinHash, onboard, sawSeed, seed] = await Promise.all([
       secureStore.get(SECURESTORE_KEY),
@@ -133,55 +142,43 @@ function My_App() {
     setShouldOnboard(onboard && onboard === "1" ? false : true);
     setSawSeedUpdate(sawSeed && sawSeed === "1" ? true : false);
     setHasSeed(!!seed);
-    // check for pin attempts and app locked state
     await handlePinForeground();
   };
 
-  const handlePinForeground = async () => {
-    // check if app has pw
-    const pw = await secureStore.get(SECURESTORE_KEY);
-    if (isNull(pw)) {
-      return;
-    }
-    // check if app is locked
-    const now = Math.ceil(Date.now() / 1000);
-    const lockData = await store.getObj<ILockData>(STORE_KEYS.lock);
-    if (lockData) {
-      // set state acccording to lockData timestamp
-      const secsPassed = now - lockData.timestamp;
-      const lockedTime = lockData.lockedTime - secsPassed;
-      setAttempts({
-        ...lockData,
-        mismatch: false,
-        lockedTime,
-      });
-    }
-    // handle app was longer than 5 mins in the background
-    const bgTimestamp = await store.get(STORE_KEYS.bgCounter);
-    if (isStr(bgTimestamp) && bgTimestamp.length > 0) {
-      if (now - +bgTimestamp > FiveMins) {
-        setBgAuth(true);
-      }
-    }
-  };
-
-  // init
   useEffect(() => {
-    async function init() {
-      await initAuth();
-      try {
-        await waitUntilReady();
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        if (!msg.includes("No seed")) {
-          throw e;
+    async function createManager() {
+      const db = await SQLite.openDatabaseAsync("cashu.db");
+      const repo = new ExpoSqliteRepositories({ database: db });
+      await repo.init();
+      async function seedGetter() {
+        const seed = await getSeed();
+        if (!seed) {
+          throw new Error("No seed found");
         }
-        // Proceed for onboarding when there's no seed yet
+        return seed;
       }
-      await initData();
-      setIsRdy(true); // APP is ready to render
+      const mgr = new Manager(repo, seedGetter, new ConsoleLogger(undefined));
+      await mgr.enableMintQuoteWatcher();
+      return mgr;
     }
-    void init();
+
+    async function init() {
+      const [_, __, mgr] = await Promise.all([
+        initAuth(),
+        initData(),
+        createManager(),
+      ]);
+      setManager(mgr);
+      setIsRdy(true);
+    }
+
+    (async () => {
+      try {
+        await init();
+      } finally {
+        await SplashScreen.hideAsync();
+      }
+    })();
     const subscription = AppState.addEventListener(
       "change",
       async (nextAppState) => {
@@ -190,11 +187,9 @@ function My_App() {
           nextAppState === "active"
         ) {
           l("[PIN] App has come to the foreground!");
-          // check for pin attempts and app locked state
           await handlePinForeground();
         } else {
           l("[PIN] App has gone to the background!");
-          // store timestamp to activate auth after > 5mins in background
           await store.set(
             STORE_KEYS.bgCounter,
             `${Math.ceil(Date.now() / 1000)}`
@@ -207,54 +202,90 @@ function My_App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  if (!isRdy) {
-    return <Blank />;
-  }
+  return {
+    isRdy,
+    manager,
+    shouldOnboard,
+    hasSeed,
+    sawSeedUpdate,
+    auth,
+    bgAuth,
+    setBgAuth,
+    pinData,
+  };
+}
 
+function AppProviders({
+  children,
+  pinData,
+}: {
+  children: React.ReactNode;
+  pinData: PinContextValue;
+}) {
   return (
     <ThemeProvider>
       <PinCtx.Provider value={pinData}>
         <PrivacyProvider>
           <MenuProvider>
             <BottomSheetModalProvider>
-              <ManagerGate fallback={<Blank />}>
-                <NavContainer>
-                  <BalanceProvider>
-                    <FocusClaimProvider>
-                      <PromptProvider>
-                        <TrustMintProvider>
-                          <QRScannerProvider>
-                            <HistoryProvider>
-                              <KnownMintsProvider>
-                                <KeyboardProvider>
-                                  <Navigator
-                                    shouldOnboard={shouldOnboard}
-                                    pinHash={auth.pinHash}
-                                    bgAuth={bgAuth}
-                                    setBgAuth={setBgAuth}
-                                    hasSeed={hasSeed}
-                                    sawSeedUpdate={sawSeedUpdate}
-                                  />
-                                  <StatusBar style="auto" />
-                                  <ClipboardModal />
-                                  <QRScannerBottomSheet />
-                                  <TrustMintModal />
-                                  <Toaster />
-                                </KeyboardProvider>
-                              </KnownMintsProvider>
-                            </HistoryProvider>
-                          </QRScannerProvider>
-                        </TrustMintProvider>
-                      </PromptProvider>
-                    </FocusClaimProvider>
-                  </BalanceProvider>
-                </NavContainer>
-              </ManagerGate>
+              <NavContainer>
+                <BalanceProvider>
+                  <FocusClaimProvider>
+                    <PromptProvider>
+                      <TrustMintProvider>
+                        <QRScannerProvider>
+                          <HistoryProvider>
+                            <KnownMintsProvider>
+                              <KeyboardProvider>{children}</KeyboardProvider>
+                            </KnownMintsProvider>
+                          </HistoryProvider>
+                        </QRScannerProvider>
+                      </TrustMintProvider>
+                    </PromptProvider>
+                  </FocusClaimProvider>
+                </BalanceProvider>
+              </NavContainer>
             </BottomSheetModalProvider>
           </MenuProvider>
         </PrivacyProvider>
       </PinCtx.Provider>
     </ThemeProvider>
+  );
+}
+
+function RootApp() {
+  const {
+    isRdy,
+    manager,
+    shouldOnboard,
+    hasSeed,
+    sawSeedUpdate,
+    auth,
+    bgAuth,
+    setBgAuth,
+    pinData,
+  } = useRootAppState();
+  if (!isRdy || !manager) {
+    return <Blank />;
+  }
+  return (
+    <ManagerProvider manager={manager}>
+      <AppProviders pinData={pinData}>
+        <Navigator
+          shouldOnboard={shouldOnboard}
+          pinHash={auth.pinHash}
+          bgAuth={bgAuth}
+          setBgAuth={setBgAuth}
+          hasSeed={hasSeed}
+          sawSeedUpdate={sawSeedUpdate}
+        />
+        <StatusBar style="auto" />
+        <ClipboardModal />
+        <QRScannerBottomSheet />
+        <TrustMintModal />
+        <Toaster />
+      </AppProviders>
+    </ManagerProvider>
   );
 }
 

@@ -1,9 +1,5 @@
 import "../shim";
-import * as SQLite from "expo-sqlite";
-import { ExpoSqliteRepositories } from "coco-cashu-expo-sqlite";
-import { ConsoleLogger, Manager } from "coco-cashu-core";
-import { getSeed } from "@src/storage/store/restore";
-import { l } from "@src/logger";
+import { Manager } from "coco-cashu-core";
 import {
   createContext,
   useContext,
@@ -69,67 +65,20 @@ export const ManagerGate = ({
 };
 
 export const ManagerProvider = ({
+  manager,
   children,
 }: {
+  manager: Manager;
   children: React.ReactNode;
 }) => {
-  const [manager, setManager] = useState<Manager | null>(null);
-  const [ready, setReady] = useState(false);
-  const [error, setError] = useState<Error | null>(null);
-  const resolveRef = useRef<((m: Manager) => void) | null>(null);
-  const rejectRef = useRef<((e: Error) => void) | null>(null);
-  const readyPromiseRef = useRef<Promise<Manager>>(
-    new Promise<Manager>((resolve, reject) => {
-      resolveRef.current = resolve;
-      rejectRef.current = reject;
-    })
-  );
-
-  useEffect(() => {
-    async function initManager() {
-      try {
-        const db = await SQLite.openDatabaseAsync("cashu.db");
-        const repo = new ExpoSqliteRepositories({ database: db });
-        await repo.init();
-
-        async function seedGetter() {
-          const seed = await getSeed();
-          if (!seed) {
-            throw new Error("No seed found");
-          }
-          return seed;
-        }
-
-        const mgr = new Manager(repo, seedGetter, new ConsoleLogger(undefined));
-        await mgr.enableMintQuoteWatcher();
-
-        setManager(mgr);
-        if (resolveRef.current) {
-          resolveRef.current(mgr);
-        }
-      } catch (e) {
-        const err = e instanceof Error ? e : new Error(String(e));
-        setError(err);
-        l("[ManagerProvider] init error", err);
-        if (rejectRef.current) {
-          rejectRef.current(err);
-        }
-      } finally {
-        setReady(true);
-      }
-    }
-    void initManager();
-  }, []);
-
-  const waitUntilReady = () => {
-    if (manager) return Promise.resolve(manager);
-    return readyPromiseRef.current;
-  };
-
   const value = useMemo(
-    () => ({ manager, ready, error, waitUntilReady }),
-    [manager, ready, error]
+    () => ({
+      manager,
+      ready: true,
+      error: null,
+      waitUntilReady: () => Promise.resolve(manager),
+    }),
+    [manager]
   );
-
   return <ManagerCtx.Provider value={value}>{children}</ManagerCtx.Provider>;
 };
